@@ -17,7 +17,7 @@
 
 DB="test"
 USER="test"
-PASS="zaphod"
+PASS=""
 ROOTPASS=""
 
 echo -e "Creating $DB database and $USER user account"
