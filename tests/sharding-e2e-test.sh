@@ -243,8 +243,13 @@ fi
 echo
 echo "Testing /api/v1/log/entries/retrieve endpoint..."
 
-UUID1=$($REKOR_CLI get --log-index 0 --rekor_server http://localhost:3000 --format json | jq -r .UUID)
+UUID1=$($REKOR_CLI get --log-index 1 --rekor_server http://localhost:3000 --format json | jq -r .UUID)
 UUID2=$($REKOR_CLI get --log-index 3 --rekor_server http://localhost:3000 --format json | jq -r .UUID)
+
+
+# Make sure retrieve by UUID in the inactive shard works
+NUM_ELEMENTS=$(curl -f http://localhost:3000/api/v1/log/entries/retrieve -H "Content-Type: application/json" -H "Accept: application/json" -d "{ \"entryUUIDs\": [\"$UUID1\"]}" | jq '. | length')
+stringsMatch $NUM_ELEMENTS "1"
 
 HEX_INITIAL_TREE_ID=$(printf "%x" $INITIAL_TREE_ID | awk '{ for(c = 0; c < 16 ; c++) s = s"0"; s = s$1; print substr(s, 1 + length(s) - 16);}')
 HEX_INITIAL_SHARD_ID=$(printf "%x" $SHARD_TREE_ID | awk '{ for(c = 0; c < 16 ; c++) s = s"0"; s = s$1; print substr(s, 1 + length(s) - 16);}')
@@ -255,5 +260,13 @@ ENTRY_ID_2=$(echo -n "$HEX_INITIAL_SHARD_ID$UUID2" | xargs echo -n)
 # -f makes sure we exit on failure
 NUM_ELEMENTS=$(curl -f http://localhost:3000/api/v1/log/entries/retrieve -H "Content-Type: application/json" -H "Accept: application/json" -d "{ \"entryUUIDs\": [\"$ENTRY_ID_1\", \"$ENTRY_ID_2\"]}" | jq '. | length')
 stringsMatch $NUM_ELEMENTS "2"
+
+# Make sure the /api/v1/log/entries/retrieve endpoint is resolving virtual indexes correctly
+NUM_ELEMENTS=$(curl -f -H "Content-Type: application/json" --data '{"logIndexes": [0,3]}'  "http://localhost:3000/api/v1/log/entries/retrieve" | jq '. | length')
+stringsMatch $NUM_ELEMENTS "2"
+
+# Make sure we get the expected LogIndex in the response when calling /retrieve endpoint
+RETRIEVE_LOGINDEX1=$(curl -f http://localhost:3000/api/v1/log/entries/retrieve -H "Content-Type: application/json" -H "Accept: application/json" -d "{ \"logIndexes\": [1]}" | jq '.[0]' | jq  -r .$UUID1.logIndex)
+stringsMatch $RETRIEVE_LOGINDEX1 "1"
 
 echo "Test passed successfully :)"

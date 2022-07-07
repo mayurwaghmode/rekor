@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
 
 	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 	"github.com/go-openapi/runtime"
@@ -107,31 +106,33 @@ func logEntryFromLeaf(ctx context.Context, signer signature.Signer, tc TrillianC
 			return nil, err
 		}
 
-		var att []byte
-		var fetchErr error
-		attKey := eimpl.AttestationKey()
-		// if we're given a key by the type logic, let's try that first
-		if attKey != "" {
-			att, fetchErr = storageClient.FetchAttestation(ctx, attKey)
-			if fetchErr != nil {
-				log.Logger.Errorf("error fetching attestation by key, trying by UUID: %s %w", attKey, fetchErr)
+		if entryWithAtt, ok := eimpl.(types.EntryWithAttestationImpl); ok {
+			var att []byte
+			var fetchErr error
+			attKey := entryWithAtt.AttestationKey()
+			// if we're given a key by the type logic, let's try that first
+			if attKey != "" {
+				att, fetchErr = storageClient.FetchAttestation(ctx, attKey)
+				if fetchErr != nil {
+					log.ContextLogger(ctx).Errorf("error fetching attestation by key, trying by UUID: %s %w", attKey, fetchErr)
+				}
 			}
-		}
-		// if looking up by key failed or we weren't able to generate a key, try looking up by uuid
-		if attKey == "" || fetchErr != nil {
-			activeTree := fmt.Sprintf("%x", tc.logID)
-			entryIDstruct, err := sharding.CreateEntryIDFromParts(activeTree, uuid)
-			if err != nil {
-				return nil, fmt.Errorf("error creating EntryID from active treeID %v and uuid %v: %w", activeTree, uuid, err)
+			// if looking up by key failed or we weren't able to generate a key, try looking up by uuid
+			if attKey == "" || fetchErr != nil {
+				activeTree := fmt.Sprintf("%x", tc.logID)
+				entryIDstruct, err := sharding.CreateEntryIDFromParts(activeTree, uuid)
+				if err != nil {
+					return nil, fmt.Errorf("error creating EntryID from active treeID %v and uuid %v: %w", activeTree, uuid, err)
+				}
+				att, fetchErr = storageClient.FetchAttestation(ctx, entryIDstruct.UUID)
+				if fetchErr != nil {
+					log.ContextLogger(ctx).Errorf("error fetching attestation by uuid: %s %v", entryIDstruct.UUID, fetchErr)
+				}
 			}
-			att, fetchErr = storageClient.FetchAttestation(ctx, entryIDstruct.UUID)
-			if fetchErr != nil {
-				log.Logger.Errorf("error fetching attestation by uuid: %s %v", entryIDstruct.UUID, fetchErr)
-			}
-		}
-		if fetchErr == nil {
-			logEntryAnon.Attestation = &models.LogEntryAnonAttestation{
-				Data: att,
+			if fetchErr == nil {
+				logEntryAnon.Attestation = &models.LogEntryAnonAttestation{
+					Data: att,
+				}
 			}
 		}
 	}
@@ -148,30 +149,13 @@ func logEntryFromLeaf(ctx context.Context, signer signature.Signer, tc TrillianC
 // GetLogEntryAndProofByIndexHandler returns the entry and inclusion proof for a specified log index
 func GetLogEntryByIndexHandler(params entries.GetLogEntryByIndexParams) middleware.Responder {
 	ctx := params.HTTPRequest.Context()
-	tid, resolvedIndex := api.logRanges.ResolveVirtualIndex(int(params.LogIndex))
-	tc := NewTrillianClientFromTreeID(ctx, tid)
-	log.RequestIDLogger(params.HTTPRequest).Debugf("Retrieving resolved index %v from TreeID %v", resolvedIndex, tid)
-
-	resp := tc.getLeafAndProofByIndex(resolvedIndex)
-	switch resp.status {
-	case codes.OK:
-	case codes.NotFound, codes.OutOfRange, codes.InvalidArgument:
-		return handleRekorAPIError(params, http.StatusNotFound, fmt.Errorf("grpc error: %w", resp.err), "")
-	default:
-		return handleRekorAPIError(params, http.StatusInternalServerError, fmt.Errorf("grpc err: %w", resp.err), trillianCommunicationError)
-	}
-
-	result := resp.getLeafAndProofResult
-	leaf := result.Leaf
-	if leaf == nil {
-		return handleRekorAPIError(params, http.StatusNotFound, errors.New("grpc returned 0 leaves with success code"), "")
-	}
-
-	logEntry, err := logEntryFromLeaf(ctx, api.signer, tc, leaf, result.SignedLogRoot, result.Proof, tid, api.logRanges)
+	logEntry, err := retrieveLogEntryByIndex(ctx, int(params.LogIndex))
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return handleRekorAPIError(params, http.StatusNotFound, fmt.Errorf("grpc error: %w", err), "")
+		}
 		return handleRekorAPIError(params, http.StatusInternalServerError, err, err.Error())
 	}
-
 	return entries.NewGetLogEntryByIndexOK().WithPayload(logEntry)
 }
 
@@ -239,32 +223,33 @@ func createLogEntry(params entries.CreateLogEntryParams) (models.LogEntry, middl
 		go func() {
 			keys, err := entry.IndexKeys()
 			if err != nil {
-				log.RequestIDLogger(params.HTTPRequest).Error(err)
+				log.ContextLogger(ctx).Error(err)
 				return
 			}
 			for _, key := range keys {
 				if err := addToIndex(context.Background(), key, entryID); err != nil {
-					log.RequestIDLogger(params.HTTPRequest).Error(err)
+					log.ContextLogger(ctx).Error(err)
 				}
 			}
 		}()
 	}
 
 	if viper.GetBool("enable_attestation_storage") {
-
-		go func() {
-			attKey, attVal := entry.AttestationKeyValue()
-			if attVal == nil {
-				log.RequestIDLogger(params.HTTPRequest).Infof("no attestation for %s", uuid)
-				return
-			}
-			if err := storeAttestation(context.Background(), attKey, attVal); err != nil {
-				// entryIDstruct.UUID
-				log.RequestIDLogger(params.HTTPRequest).Errorf("error storing attestation: %s", err)
+		if entryWithAtt, ok := entry.(types.EntryWithAttestationImpl); ok {
+			attKey, attVal := entryWithAtt.AttestationKeyValue()
+			if attVal != nil {
+				go func() {
+					if err := storeAttestation(context.Background(), attKey, attVal); err != nil {
+						// entryIDstruct.UUID
+						log.ContextLogger(ctx).Errorf("error storing attestation: %s", err)
+					} else {
+						log.ContextLogger(ctx).Infof("stored attestation for uuid %s with filename %s", entryIDstruct.UUID, attKey)
+					}
+				}()
 			} else {
-				log.RequestIDLogger(params.HTTPRequest).Infof("stored attestation for uuid %s with filename %s", entryIDstruct.UUID, attKey)
+				log.ContextLogger(ctx).Infof("no attestation returned for %s", uuid)
 			}
-		}()
+		}
 	}
 
 	signature, err := signEntry(ctx, api.signer, logEntryAnon)
@@ -312,43 +297,14 @@ func getEntryURL(locationURL url.URL, uuid string) strfmt.URI {
 
 // GetLogEntryByUUIDHandler gets log entry and inclusion proof for specified UUID aka merkle leaf hash
 func GetLogEntryByUUIDHandler(params entries.GetLogEntryByUUIDParams) middleware.Responder {
-	uuid, err := sharding.GetUUIDFromIDString(params.EntryUUID)
+	logEntry, err := retrieveLogEntry(params.HTTPRequest.Context(), params.EntryUUID)
 	if err != nil {
-		return handleRekorAPIError(params, http.StatusBadRequest, err, fmt.Sprintf("could not get UUID from ID string %v", params.EntryUUID))
-	}
-	tidString, err := sharding.GetTreeIDFromIDString(params.EntryUUID)
-
-	// If treeID is found in EntryID, route to correct tree
-	if err == nil {
-		tid, err := strconv.ParseInt(tidString, 16, 64)
-		if err != nil {
-			return handleRekorAPIError(params, http.StatusBadRequest, err, fmt.Sprintf("could not convert treeID %v to int", tidString))
+		if _, ok := (err).(types.ValidationError); ok {
+			return handleRekorAPIError(params, http.StatusBadRequest, err, "incorrectly formatted uuid %s", params.EntryUUID)
 		}
-		logEntry, err := RetrieveUUID(params, uuid, tid)
-		if err != nil {
-			if errors.Is(err, ErrNotFound) {
-				return handleRekorAPIError(params, http.StatusNotFound, err, "")
-			}
-			return handleRekorAPIError(params, http.StatusInternalServerError, err, "")
-		}
-		return entries.NewGetLogEntryByUUIDOK().WithPayload(logEntry)
+		return handleRekorAPIError(params, http.StatusInternalServerError, err, "ID %s not found in any known trees", params.EntryUUID)
 	}
-
-	// If EntryID is plain UUID (ex. from client v0.5), check all trees
-	if errors.Is(err, sharding.ErrPlainUUID) {
-		trees := []sharding.LogRange{{TreeID: api.logRanges.ActiveTreeID()}}
-		trees = append(trees, api.logRanges.GetInactive()...)
-
-		for _, t := range trees {
-			logEntry, err := RetrieveUUID(params, uuid, t.TreeID)
-			if err != nil {
-				continue
-			}
-			return entries.NewGetLogEntryByUUIDOK().WithPayload(logEntry)
-		}
-		return handleRekorAPIError(params, http.StatusNotFound, err, "UUID not found in any known trees")
-	}
-	return handleRekorAPIError(params, http.StatusBadRequest, err, fmt.Sprintf("could not get treeID from ID string %v", params.EntryUUID))
+	return entries.NewGetLogEntryByUUIDOK().WithPayload(logEntry)
 }
 
 // SearchLogQueryHandler searches log by index, UUID, or proposed entry and returns array of entries found with inclusion proofs
@@ -366,17 +322,11 @@ func SearchLogQueryHandler(params entries.SearchLogQueryParams) middleware.Respo
 			if err != nil {
 				return handleRekorAPIError(params, http.StatusBadRequest, err, fmt.Sprintf("could not get UUID from ID string %v", entryID))
 			}
-			if tid, err := sharding.TreeID(entryID); err == nil {
-				entry, err := RetrieveUUID(entries.GetLogEntryByUUIDParams{
-					EntryUUID:   entryID,
-					HTTPRequest: params.HTTPRequest,
-				}, uuid, tid)
-				if err != nil {
-					return handleRekorAPIError(params, http.StatusBadRequest, err, fmt.Sprintf("could not get uuid from %v", entryID))
-				}
-				resultPayload = append(resultPayload, entry)
+			if logEntry, err := retrieveLogEntry(httpReqCtx, entryID); err == nil {
+				resultPayload = append(resultPayload, logEntry)
 				continue
 			}
+			// If we couldn't get the entry, search for the hash later
 			hash, err := hex.DecodeString(uuid)
 			if err != nil {
 				return handleRekorAPIError(params, http.StatusBadRequest, err, malformedUUID)
@@ -447,36 +397,20 @@ func SearchLogQueryHandler(params entries.SearchLogQueryParams) middleware.Respo
 	if len(params.Entry.LogIndexes) > 0 {
 		g, _ := errgroup.WithContext(httpReqCtx)
 
-		leafResults := make([]*trillian.GetEntryAndProofResponse, len(params.Entry.LogIndexes))
-		for i, logIndex := range params.Entry.LogIndexes {
-			i, logIndex := i, logIndex // https://golang.org/doc/faq#closures_and_goroutines
+		for _, logIndex := range params.Entry.LogIndexes {
+			logIndex := logIndex // https://golang.org/doc/faq#closures_and_goroutines
 			g.Go(func() error {
-				resp := tc.getLeafAndProofByIndex(swag.Int64Value(logIndex))
-				switch resp.status {
-				case codes.OK, codes.NotFound:
-				default:
-					return resp.err
+				logEntry, err := retrieveLogEntryByIndex(httpReqCtx, int(swag.Int64Value(logIndex)))
+				if err != nil {
+					return err
 				}
-				leafResult := resp.getLeafAndProofResult
-				if leafResult != nil && leafResult.Leaf != nil {
-					leafResults[i] = leafResult
-				}
+				resultPayload = append(resultPayload, logEntry)
 				return nil
 			})
 		}
 
 		if err := g.Wait(); err != nil {
 			return handleRekorAPIError(params, http.StatusInternalServerError, fmt.Errorf("grpc error: %w", err), trillianUnexpectedResult)
-		}
-
-		for _, result := range leafResults {
-			if result != nil {
-				logEntry, err := logEntryFromLeaf(httpReqCtx, api.signer, tc, result.Leaf, result.SignedLogRoot, result.Proof, api.logRanges.ActiveTreeID(), api.logRanges)
-				if err != nil {
-					return handleRekorAPIError(params, http.StatusInternalServerError, err, trillianUnexpectedResult)
-				}
-				resultPayload = append(resultPayload, logEntry)
-			}
 		}
 	}
 
@@ -485,16 +419,69 @@ func SearchLogQueryHandler(params entries.SearchLogQueryParams) middleware.Respo
 
 var ErrNotFound = errors.New("grpc returned 0 leaves with success code")
 
-// Attempt to retrieve a UUID from a backend tree
-func RetrieveUUID(params entries.GetLogEntryByUUIDParams, uuid string, tid int64) (models.LogEntry, error) {
-	ctx := params.HTTPRequest.Context()
-	hashValue, err := hex.DecodeString(uuid)
-	if err != nil {
-		return models.LogEntry{}, err
+func retrieveLogEntryByIndex(ctx context.Context, logIndex int) (models.LogEntry, error) {
+	tid, resolvedIndex := api.logRanges.ResolveVirtualIndex(logIndex)
+	tc := NewTrillianClientFromTreeID(ctx, tid)
+	log.ContextLogger(ctx).Debugf("Retrieving resolved index %v from TreeID %v", resolvedIndex, tid)
+
+	resp := tc.getLeafAndProofByIndex(resolvedIndex)
+	switch resp.status {
+	case codes.OK:
+	case codes.NotFound, codes.OutOfRange, codes.InvalidArgument:
+		return models.LogEntry{}, ErrNotFound
+	default:
+		return models.LogEntry{}, fmt.Errorf("grpc err: %w: %s", resp.err, trillianCommunicationError)
 	}
 
-	tc := NewTrillianClientFromTreeID(params.HTTPRequest.Context(), tid)
-	log.RequestIDLogger(params.HTTPRequest).Debugf("Attempting to retrieve UUID %v from TreeID %v", uuid, tid)
+	result := resp.getLeafAndProofResult
+	leaf := result.Leaf
+	if leaf == nil {
+		return models.LogEntry{}, ErrNotFound
+	}
+
+	return logEntryFromLeaf(ctx, api.signer, tc, leaf, result.SignedLogRoot, result.Proof, tid, api.logRanges)
+}
+
+// Retrieve a Log Entry
+// If a tree ID is specified, look in that tree
+// Otherwise, look through all inactive and active shards
+func retrieveLogEntry(ctx context.Context, entryUUID string) (models.LogEntry, error) {
+	uuid, err := sharding.GetUUIDFromIDString(entryUUID)
+	if err != nil {
+		return models.LogEntry{}, sharding.ErrPlainUUID
+	}
+
+	// Get the tree ID and check that shard for the entry
+	tid, err := sharding.TreeID(entryUUID)
+	if err == nil {
+		return retrieveUUIDFromTree(ctx, uuid, tid)
+	}
+
+	// If we got a UUID instead of an EntryID, search all shards
+	if errors.Is(err, sharding.ErrPlainUUID) {
+		trees := []sharding.LogRange{{TreeID: api.logRanges.ActiveTreeID()}}
+		trees = append(trees, api.logRanges.GetInactive()...)
+
+		for _, t := range trees {
+			logEntry, err := retrieveUUIDFromTree(ctx, uuid, t.TreeID)
+			if err != nil {
+				continue
+			}
+			return logEntry, nil
+		}
+	}
+
+	return models.LogEntry{}, err
+}
+
+func retrieveUUIDFromTree(ctx context.Context, uuid string, tid int64) (models.LogEntry, error) {
+	hashValue, err := hex.DecodeString(uuid)
+	if err != nil {
+		return models.LogEntry{}, types.ValidationError(err)
+	}
+
+	tc := NewTrillianClientFromTreeID(ctx, tid)
+	log.ContextLogger(ctx).Debugf("Attempting to retrieve UUID %v from TreeID %v", uuid, tid)
 
 	resp := tc.getLeafAndProofByHash(hashValue)
 	switch resp.status {
@@ -514,6 +501,7 @@ func RetrieveUUID(params entries.GetLogEntryByUUIDParams, uuid string, tid int64
 	case codes.NotFound:
 		return models.LogEntry{}, ErrNotFound
 	default:
+		log.ContextLogger(ctx).Errorf("Unexpected response code while attempting to retrieve UUID %v from TreeID %v: %v", uuid, tid, resp.status)
 		return models.LogEntry{}, errors.New("unexpected error")
 	}
 }
